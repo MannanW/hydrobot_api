@@ -12,13 +12,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import time
+from typing import Any, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Literal, Optional
 
 # Allow `from engine.hydrobot import ...` whether this file is run as
 # `uvicorn api.main:app` from the project root, or some other layout.
@@ -27,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine.hydrobot import (  # noqa: E402
     CropNotFoundError,
     InsufficientDataError,
+    get_cached_analysis,
     run_analysis,
 )
 
@@ -150,6 +153,17 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class AnalyseJobResponse(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "done", "error"]
+
+
+class AnalyseJobStatusResponse(BaseModel):
+    status: Literal["pending", "running", "done", "error"]
+    result: Optional[AnalyseResponse] = None
+    error: Optional[str] = None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────
@@ -158,9 +172,46 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+jobs: dict[str, dict[str, Any]] = {}
+
+
+def _make_job_id() -> str:
+    return hashlib.sha256(f"{time.time()}-{os.urandom(8).hex()}".encode("utf-8")).hexdigest()[:24]
+
+
+def _save_job(job_id: str, state: str, result: Optional[dict[str, Any]] = None, error: Optional[str] = None) -> None:
+    jobs[job_id] = {
+        "status": state,
+        "result": result,
+        "error": error,
+    }
+
+
+def _build_job_result(body: AnalyseRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_id": body.user_id,
+        "crop": body.crop,
+        "scope": body.scope,
+        **payload,
+    }
+
+
+def _train_and_store_job(job_id: str, body: AnalyseRequest) -> None:
+    _save_job(job_id, "running")
+    try:
+        result = run_analysis(
+            crop=body.crop,
+            scope=body.scope,
+            user_id=body.user_id,
+        )
+        _save_job(job_id, "done", result=_build_job_result(body, result))
+    except Exception as exc:
+        _save_job(job_id, "error", error=str(exc))
+
+
 @app.post(
     "/analyse",
-    response_model=AnalyseResponse,
+    response_model=AnalyseJobResponse,
     responses={
         401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
         404: {"model": ErrorResponse, "description": "Crop not found"},
@@ -168,23 +219,41 @@ def health() -> HealthResponse:
     },
     dependencies=[Depends(verify_api_key)],
 )
-def analyse(body: AnalyseRequest) -> AnalyseResponse:
+def analyse(body: AnalyseRequest, background_tasks: BackgroundTasks) -> AnalyseJobResponse:
+    job_id = _make_job_id()
+    _save_job(job_id, "pending")
+
     try:
-        result = run_analysis(
-            crop=body.crop,
-            scope=body.scope,
-            user_id=body.user_id,
-        )
+        cached_result = get_cached_analysis(crop=body.crop, scope=body.scope, user_id=body.user_id)
     except CropNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InsufficientDataError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return AnalyseResponse(
-        user_id=body.user_id,
-        crop=body.crop,
-        scope=body.scope,
-        data_quality_summary=result["data_quality_summary"],
-        model_performance=result["model_performance"],
-        golden_recipe_and_optimizer=result["golden_recipe_and_optimizer"],
-    )
+    if cached_result is not None:
+        _save_job(job_id, "done", result=_build_job_result(body, cached_result))
+        return AnalyseJobResponse(job_id=job_id, status="done")
+
+    background_tasks.add_task(_train_and_store_job, job_id, body)
+    return AnalyseJobResponse(job_id=job_id, status="pending")
+
+
+@app.get(
+    "/analyse/{job_id}",
+    response_model=AnalyseJobStatusResponse,
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        404: {"model": ErrorResponse, "description": "Job not found"},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def analyse_status(job_id: str) -> AnalyseJobStatusResponse:
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    status = job["status"]
+    result = job.get("result")
+    error = job.get("error")
+    if status == "error" and error is None:
+        error = "Unknown error"
+    return AnalyseJobStatusResponse(status=status, result=result, error=error)

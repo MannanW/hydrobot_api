@@ -21,11 +21,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
+import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Hashable, Optional, cast
 
+import joblib  # type: ignore[import]
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
@@ -83,7 +87,63 @@ def _resolve_data_file() -> Path:
     return DEFAULT_DATA_FILE
 
 
+@lru_cache(maxsize=1)
+def _load_workbook_sheets() -> list[str]:
+    xl = pd.ExcelFile(DATA_FILE, engine="openpyxl")
+    return [str(s) for s in xl.sheet_names]
+
+
+@lru_cache(maxsize=32)
+def _read_sheet(sheet_name: str) -> pd.DataFrame:
+    df = pd.read_excel(DATA_FILE, sheet_name=sheet_name, engine="openpyxl")  # type: ignore[call-overload]
+    return df.copy(deep=True)
+
+
+def _ensure_cache_dir() -> None:
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_identifier(value: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in value.lower())[:48]
+
+
+def _training_data_fingerprint(df: pd.DataFrame, feature_cols: list[str]) -> str:
+    payload = df[feature_cols + [TARGET_WEIGHT, TARGET_HEIGHT]].astype(str)
+    digest = hashlib.sha256(payload.to_csv(index=False).encode("utf-8")).hexdigest()
+    return f"{len(df)}-{digest}"
+
+
+def _cache_file_path(crop: str, scope: str, fingerprint: str) -> Path:
+    _ensure_cache_dir()
+    file_name = f"{_safe_identifier(crop)}_{_safe_identifier(scope)}_{fingerprint[:16]}.joblib"
+    return MODEL_CACHE_DIR / file_name
+
+
+def _load_cached_analysis(crop: str, scope: str, fingerprint: str) -> Optional[dict[str, Any]]:
+    path = _cache_file_path(crop, scope, fingerprint)
+    if not path.exists():
+        return None
+    cached = joblib.load(path)  # type: ignore[assignment]
+    if isinstance(cached, dict) and "result" in cached:
+        return cast(dict[str, Any], cached["result"])
+    return None
+
+
+def _save_cached_analysis(crop: str, scope: str, fingerprint: str, payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    path = _cache_file_path(crop, scope, fingerprint)
+    joblib.dump({"result": payload, "metadata": metadata}, path)  # type: ignore[call-arg]
+
+
+def get_cached_analysis(crop: str, scope: str, user_id: str) -> Optional[dict[str, Any]]:
+    df_raw = _load_training_rows(crop=crop, scope=scope, user_id=user_id)
+    df, feature_cols, _quality = _clean_and_validate(df_raw, crop=crop)
+    fingerprint = _training_data_fingerprint(df, feature_cols)
+    return _load_cached_analysis(crop, scope, fingerprint)
+
+
 DATA_FILE = _resolve_data_file()
+CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache"
+MODEL_CACHE_DIR = CACHE_DIR / "model_cache"
 
 BIO_MAP_IN: dict[str, int] = {"Water": 0, "Trichoderma": 1}
 BIO_MAP_OUT: dict[int, str] = {0: "Water", 1: "Trichoderma"}
@@ -99,9 +159,9 @@ TARGET_HEIGHT = "Height"
 MIN_ROWS = 20
 
 PARAM_GRID: dict[str, list[Any]] = {
-    "n_estimators": [100, 200, 300],
-    "max_depth": [5, 10, 20, None],
-    "min_samples_split": [2, 4, 6],
+    "n_estimators": [100, 200],
+    "max_depth": [10, 20, None],
+    "min_samples_split": [2, 4],
     "max_features": ["sqrt", 0.7],
 }
 
@@ -141,9 +201,20 @@ def _levenshtein(s1: str, s2: str) -> int:
 
 
 def _closest_sheet(name: str, available: list[str]) -> Optional[str]:
+    """
+    Fuzzy-matches `name` against `available` sheet names, but only
+    accepts a match within a threshold that scales with name length.
+    A flat threshold (e.g. always <= 4) is too permissive for short
+    names — "Spinach" vs "Pakchoi" has edit distance 4 despite being
+    completely unrelated crops. Scaling by length keeps short names
+    strict while still tolerating a typo or two on longer names.
+    """
+    if not available:
+        return None
     scored = sorted(((_levenshtein(name, a), a) for a in available), key=lambda t: t[0])
     best_dist, best_name = scored[0]
-    return best_name if best_dist <= 4 else None
+    max_allowed = max(1, min(3, len(name) // 4))
+    return best_name if best_dist <= max_allowed else None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -164,9 +235,7 @@ def _load_training_rows(crop: str, scope: str, user_id: str) -> pd.DataFrame:
     if not os.path.exists(DATA_FILE):
         raise CropNotFoundError(f"Data source not found at {DATA_FILE}")
 
-    xl = pd.ExcelFile(DATA_FILE, engine="openpyxl")
-    sheets = [str(s) for s in xl.sheet_names]
-
+    sheets = _load_workbook_sheets()
     exact = next((s for s in sheets if s.lower() == crop.lower()), None)
     sheet_name = exact or _closest_sheet(crop, sheets)
     if sheet_name is None:
@@ -174,8 +243,7 @@ def _load_training_rows(crop: str, scope: str, user_id: str) -> pd.DataFrame:
             f"No crop matching '{crop}' found. Available crops: {', '.join(sheets)}"
         )
 
-    df_raw = pd.read_excel(DATA_FILE, sheet_name=sheet_name, engine="openpyxl")  # type: ignore[call-overload]
-    return df_raw
+    return _read_sheet(sheet_name)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -268,13 +336,13 @@ def _build_optimizer_grid(df: pd.DataFrame, feature_cols: list[str]) -> dict[str
         else:
             raw_uniq = sorted(raw_uniq, key=lambda v: str(v))
         if len(raw_uniq) > 8:
-            indices = [int(i) for i in np.linspace(0, len(raw_uniq) - 1, 8)]
-            raw_uniq = [raw_uniq[i] for i in indices]
+            step = max(1, len(raw_uniq) // 8)
+            raw_uniq = [raw_uniq[i] for i in range(0, len(raw_uniq), step)][:8]
         grid[col] = [round(float(v), 4) if isinstance(v, float) else v for v in raw_uniq]
     return grid
 
 
-def _format_recipe(row: dict[Hashable, Any] | pd.Series, feature_cols: list[str]) -> dict[str, Any]:
+def _format_recipe(row: dict[Hashable, Any] | pd.Series[Any], feature_cols: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for feat in feature_cols:
         raw_val = row.get(feat, None) if isinstance(row, dict) else row.get(feat, None)
@@ -303,6 +371,11 @@ def run_analysis(crop: str, scope: str, user_id: str) -> dict[str, Any]:
     df, feature_cols, quality = _clean_and_validate(df_raw, crop=crop)
     quality["crop"] = crop
     quality["scope"] = scope
+
+    fingerprint = _training_data_fingerprint(df, feature_cols)
+    cached = _load_cached_analysis(crop, scope, fingerprint)
+    if cached is not None:
+        return cached
 
     X = df[feature_cols].to_numpy(dtype=np.float64)
     y_w = df[TARGET_WEIGHT].to_numpy(dtype=np.float64)
@@ -341,16 +414,16 @@ def run_analysis(crop: str, scope: str, user_id: str) -> dict[str, Any]:
     for v_list in og_vals:
         total_combos *= len(v_list)
 
-    all_combos = [
-        dict(zip(og_keys, combo))
-        for combo in itertools.product(*og_vals)
-        if _is_valid(dict(zip(og_keys, combo)))
-    ]
+    valid_combos: list[dict[str, Any]] = []
+    for combo in itertools.product(*og_vals):
+        recipe = dict(zip(og_keys, combo))
+        if _is_valid(recipe):
+            valid_combos.append(recipe)
 
-    if not all_combos:
-        raise InsufficientDataError(crop, len(all_combos))
+    if not valid_combos:
+        raise InsufficientDataError(crop, len(valid_combos))
 
-    recipes_df = pd.DataFrame(all_combos)
+    recipes_df = pd.DataFrame(valid_combos)
     recipes_X = recipes_df[feature_cols].to_numpy(dtype=np.float64)
     recipes_df["Predicted_Weight"] = np.asarray(best_model_w.predict(recipes_X), dtype=np.float64)  # type: ignore
     recipes_df["Predicted_Height"] = np.asarray(best_model_h.predict(recipes_X), dtype=np.float64)  # type: ignore
@@ -366,20 +439,23 @@ def run_analysis(crop: str, scope: str, user_id: str) -> dict[str, Any]:
 
     ranked = recipes_df.sort_values("Score", ascending=False)
     best_recipe_row = ranked.iloc[0]
-
     pred_w = float(best_recipe_row["Predicted_Weight"])
     pred_h = float(best_recipe_row["Predicted_Height"])
-    pct_w = float((df[TARGET_WEIGHT] < pred_w).mean() * 100)
-    pct_h = float((df[TARGET_HEIGHT] < pred_h).mean() * 100)
+
+    target_weight = df[TARGET_WEIGHT].to_numpy(dtype=np.float64)
+    target_height = df[TARGET_HEIGHT].to_numpy(dtype=np.float64)
+    pct_w = float((target_weight < pred_w).mean() * 100)
+    pct_h = float((target_height < pred_h).mean() * 100)
 
     top5 = ranked.head(5)
     alternatives: list[dict[str, Any]] = []
-    for _, row in top5.iterrows():
+    for row in top5.itertuples(index=False, name=None):
+        recipe_vals = cast(dict[Hashable, Any], dict(zip(top5.columns, row)))
         alternatives.append({
-            "recipe": _format_recipe(row.to_dict(), feature_cols),
-            "predicted_weight_g": round(float(row["Predicted_Weight"]), 2),
-            "predicted_height_cm": round(float(row["Predicted_Height"]), 2),
-            "composite_score": round(float(row["Score"]), 4),
+            "recipe": _format_recipe(recipe_vals, feature_cols),
+            "predicted_weight_g": round(float(recipe_vals["Predicted_Weight"]), 2),
+            "predicted_height_cm": round(float(recipe_vals["Predicted_Height"]), 2),
+            "composite_score": round(float(recipe_vals["Score"]), 4),
         })
 
     golden_recipe_and_optimizer: dict[str, Any] = {
@@ -393,13 +469,26 @@ def run_analysis(crop: str, scope: str, user_id: str) -> dict[str, Any]:
         "top_5_alternatives": alternatives,
         "combinations_explored": {
             "total": total_combos,
-            "biologically_valid": len(all_combos),
-            "filtered_out": total_combos - len(all_combos),
+            "biologically_valid": len(valid_combos),
+            "filtered_out": total_combos - len(valid_combos),
         },
     }
 
-    return {
+    result = {
         "data_quality_summary": quality,
         "model_performance": model_performance,
         "golden_recipe_and_optimizer": golden_recipe_and_optimizer,
     }
+
+    _save_cached_analysis(
+        crop,
+        scope,
+        fingerprint,
+        result,
+        {
+            "cached_at": time.time(),
+            "rows_used": len(df),
+            "feature_cols": feature_cols,
+        },
+    )
+    return result
