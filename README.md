@@ -8,8 +8,7 @@ to stay fast after the first request per crop/scope.
 ## Structure
 ```
 .python-version          # pins Python 3.11.10 — required, see "Deploying" below
-api/
-  main.py                 # FastAPI app: auth, job queue, request/response validation
+main.py                   # FastAPI app: auth, job queue, request/response validation
 engine/
   hydrobot.py              # ML pipeline + disk cache (extracted from hydrobotv4.py)
   __init__.py
@@ -22,7 +21,7 @@ reads it.)
 ## Run locally
 ```bash
 pip install -r requirements.txt
-uvicorn api.main:app --reload --port 8000
+uvicorn main:app --reload --port 8000
 ```
 Visit `http://localhost:8000/docs` for interactive API docs.
 
@@ -109,7 +108,7 @@ unset — **never** falls back to allowing all origins.
 ## Deploying on Render
 
 - **Build Command:** `pip install -r requirements.txt`
-- **Start Command:** `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
+- **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Env vars:** `HYDROBOT_API_KEY`, `FRONTEND_ORIGINS`
 
 **The `.python-version` file at the repo root is required**, not

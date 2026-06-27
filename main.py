@@ -29,15 +29,30 @@ from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Allow `from engine.hydrobot import ...` regardless of how this file
-# is launched. main.py lives in api/, so the real repo root is one
-# level up from this file's directory — not this file's own directory.
-# (Relying on the launch cwd already being the repo root is fragile:
-# it happens to work if uvicorn is invoked from the repo root, but
-# breaks if it's ever invoked from elsewhere, e.g. via --app-dir or a
-# process manager that cd's somewhere else first.)
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.dirname(_this_dir)
+# Allow `from engine.hydrobot import ...` regardless of where this
+# file sits in the repo (root, api/, or anywhere else) and regardless
+# of the launch cwd. This has broken twice already from a fixed
+# "walk up N levels" assumption that silently went stale the moment
+# the folder layout changed — so instead of hardcoding a depth, walk
+# up from this file's directory until we find a directory that
+# actually contains an `engine` package, and use THAT as repo_root.
+def _find_repo_root(start: str) -> str:
+    current = start
+    for _ in range(6):  # six levels is far more than this repo should ever need
+        if os.path.isdir(os.path.join(current, "engine")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:  # reached filesystem root, stop
+            break
+        current = parent
+    # Fall back to the starting directory if `engine/` was never found —
+    # this preserves the old (sometimes-correct) behavior rather than
+    # silently doing nothing, and the subsequent import error will be
+    # informative if this fallback path is ever actually hit.
+    return start
+
+
+repo_root = _find_repo_root(os.path.dirname(os.path.abspath(__file__)))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
