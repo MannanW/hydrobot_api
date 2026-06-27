@@ -3,11 +3,18 @@
 #
 # Contract:
 #   - Auth: X-API-Key header must match env var HYDROBOT_API_KEY
-#   - GET  /health   -> { "status": "ok" }
-#   - POST /analyse  -> { user_id, crop, scope } -> dashboard JSON
+#   - GET  /health      -> { "status": "ok" }
+#   - POST /analyse     -> { user_id, crop, scope, rows: [...] }
+#                          -> { job_id, status: "pending" | "done" }
+#   - GET  /analyse/{job_id} -> { status, result, error }
+#
+# As of v4: training rows are sent directly in the POST /analyse body
+# (fetched by the caller's backend, which owns the database and its
+# row-level security — see TrainingRow below for the exact shape).
+# This API never reads a local data file or holds a DB credential.
 #
 # ML logic lives in engine/hydrobot.py — this file is transport only:
-# auth, request/response validation, error translation to HTTP codes.
+# auth, request/response validation, job queue, error translation.
 # =====================================================================
 
 from __future__ import annotations
@@ -20,11 +27,19 @@ from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Allow `from engine.hydrobot import ...` whether this file is run as
-# `uvicorn api.main:app` from the project root, or some other layout.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow `from engine.hydrobot import ...` regardless of how this file
+# is launched. main.py lives in api/, so the real repo root is one
+# level up from this file's directory — not this file's own directory.
+# (Relying on the launch cwd already being the repo root is fragile:
+# it happens to work if uvicorn is invoked from the repo root, but
+# breaks if it's ever invoked from elsewhere, e.g. via --app-dir or a
+# process manager that cd's somewhere else first.)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(_this_dir)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from engine.hydrobot import (  # noqa: E402
     CropNotFoundError,
@@ -36,7 +51,7 @@ from engine.hydrobot import (  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────
 # App setup
 # ─────────────────────────────────────────────────────────────────────
-app = FastAPI(title="HydroBot API", version="2.0.0")
+app = FastAPI(title="HydroBot API", version="4.0.0")
 
 # Restrict CORS to your real frontend origin(s). Set FRONTEND_ORIGINS
 # as a comma-separated env var, e.g.:
@@ -72,10 +87,38 @@ def verify_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-
 # ─────────────────────────────────────────────────────────────────────
 # Request models
 # ─────────────────────────────────────────────────────────────────────
+class TrainingRow(BaseModel):
+    """
+    One labelled trial row. Matches engine.hydrobot.ALL_FEATURES plus
+    the two targets. All feature fields are optional since a given
+    crop sheet may not have every column — the engine only trains on
+    whichever features are actually present across the rows it
+    receives. `Biofertilizer innoculation` is the human-readable
+    string ("Water" / "Trichoderma"), not pre-encoded — the engine
+    does that mapping itself, same as it always has.
+    """
+
+    Day: Optional[float] = None
+    Seed_density: Optional[float] = Field(default=None, alias="Seed density")
+    Seed_soaking_time: Optional[float] = Field(default=None, alias="Seed soaking time")
+    Biofertilizer_innoculation: Optional[str] = Field(default=None, alias="Biofertilizer innoculation")
+    Cocopeat: Optional[float] = None
+    Harvest_time: Optional[float] = Field(default=None, alias="Harvest time")
+    Blackout_duration: Optional[float] = Field(default=None, alias="Blackout duration")
+    Nutrient_EC: Optional[float] = Field(default=None, alias="Nutrient EC")
+    nutrient_spray_start_day: Optional[float] = Field(default=None, alias="nutrient spray start day")
+    media_thickness: Optional[float] = Field(default=None, alias="media thickness")
+    Weight: Optional[float] = None
+    Height: Optional[float] = None
+
+    model_config = {"populate_by_name": True}
+
+
 class AnalyseRequest(BaseModel):
     user_id: str
     crop: str
     scope: Literal["private", "global"]
+    rows: list[TrainingRow]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -175,6 +218,22 @@ def health() -> HealthResponse:
 jobs: dict[str, dict[str, Any]] = {}
 
 
+def _rows_to_dicts(rows: list[TrainingRow]) -> list[dict[str, Any]]:
+    """
+    Converts TrainingRow models to plain dicts using the original
+    column names (e.g. "Seed density", not "Seed_density") via their
+    Pydantic aliases, since that's what engine.hydrobot expects. Drops
+    any field left as None so the engine's own per-feature handling
+    (whichever columns are actually present) behaves the same as it
+    did when reading straight from an Excel sheet with missing columns.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        as_dict = row.model_dump(by_alias=True, exclude_none=True)
+        out.append(as_dict)
+    return out
+
+
 def _make_job_id() -> str:
     return hashlib.sha256(f"{time.time()}-{os.urandom(8).hex()}".encode("utf-8")).hexdigest()[:24]
 
@@ -202,7 +261,7 @@ def _train_and_store_job(job_id: str, body: AnalyseRequest) -> None:
         result = run_analysis(
             crop=body.crop,
             scope=body.scope,
-            user_id=body.user_id,
+            rows=_rows_to_dicts(body.rows),
         )
         _save_job(job_id, "done", result=_build_job_result(body, result))
     except Exception as exc:
@@ -224,7 +283,9 @@ def analyse(body: AnalyseRequest, background_tasks: BackgroundTasks) -> AnalyseJ
     _save_job(job_id, "pending")
 
     try:
-        cached_result = get_cached_analysis(crop=body.crop, scope=body.scope, user_id=body.user_id)
+        cached_result = get_cached_analysis(
+            crop=body.crop, scope=body.scope, rows=_rows_to_dicts(body.rows)
+        )
     except CropNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InsufficientDataError as exc:

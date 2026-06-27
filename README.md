@@ -1,4 +1,4 @@
-# HydroBot API v3
+# HydroBot API v4
 
 Trains RandomForest models on microgreens trial data and returns a
 data quality report, model performance metrics, and an optimized
@@ -13,10 +13,11 @@ api/
 engine/
   hydrobot.py              # ML pipeline + disk cache (extracted from hydrobotv4.py)
   __init__.py
-data/
-  Microgreens_dataa.xlsx   # PLACEHOLDER data source — see below
 requirements.txt
 ```
+(`data/Microgreens_dataa.xlsx`, if present, is only used by local
+fallback scripts/tests — see "Data source" below. The live API never
+reads it.)
 
 ## Run locally
 ```bash
@@ -30,8 +31,10 @@ Visit `http://localhost:8000/docs` for interactive API docs.
 This is **not** a single request/response call — training can take
 30+ seconds, so the API uses a job + polling pattern:
 
-1. **`POST /analyse`** with `{user_id, crop, scope}` → returns
-   immediately with `{job_id, status}`.
+1. **`POST /analyse`** with `{user_id, crop, scope, rows}` — `rows`
+   is the actual training data (a list of trial records; see "Data
+   source" below for the exact shape) — returns immediately with
+   `{job_id, status}`.
    - If a valid cached model already exists for this exact
      `(crop, scope, data)` combination, `status` comes back as
      `"done"` right away — the result is in the next call's response.
@@ -119,42 +122,60 @@ versions in `requirements.txt`. If you ever bump a dependency version,
 re-check that a matching wheel exists for whatever Python version
 you're pinned to before deploying.
 
-## Important: the data source is still a placeholder
+## Data source
 
-`engine/hydrobot.py`'s `_load_training_rows()` currently loads from
-the bundled `data/Microgreens_dataa.xlsx` by matching `crop` to a
-sheet name — it ignores `user_id` and `scope` entirely. This is a
-deliberate stand-in so the full pipeline (including caching) can run
-end-to-end today. Before this goes near real users, replace that one
-function with a real query, e.g.:
+`run_analysis()` / `get_cached_analysis()` take training rows directly
+as a parameter — a list of dicts, one per labelled trial. **This API
+holds no database credential and reads no local data file in the live
+path.** The caller (e.g. a backend that owns the database and its
+row-level security) is responsible for fetching the correct rows for
+the requested `user_id` + `scope` before calling `POST /analyse`:
 
-```sql
-SELECT features, targets FROM training_rows
-WHERE crop = :crop
-  AND (user_id = :user_id OR (:scope = 'global' AND share_global = true))
-```
+- `scope: "private"` → only that user's own rows for the crop.
+- `scope: "global"` → that user's rows plus any rows from other users
+  marked as shared, for the crop.
 
-Nothing else in the pipeline needs to change — cleaning, training,
-caching, and the optimizer all just need a DataFrame with the right
-columns in, same as today. The cache's data-fingerprinting also keeps
-working unmodified: once real rows are flowing in, any new upload
-changes the fingerprint and triggers a one-time retrain automatically.
+Each row must contain the feature columns the model trains on (a
+subset of `Day`, `Seed density`, `Seed soaking time`,
+`Biofertilizer innoculation`, `Cocopeat`, `Harvest time`,
+`Blackout duration`, `Nutrient EC`, `nutrient spray start day`,
+`media thickness` — whichever are present in the data) plus the two
+targets, `Weight` and `Height`. `Biofertilizer innoculation` is sent
+as the human-readable string (`"Water"` / `"Trichoderma"`), not a
+pre-encoded number — the engine does that mapping itself, same as it
+always did when reading straight from a spreadsheet.
 
-## Known data gap
+The cache's data-fingerprinting works the same regardless of where
+rows came from: any change in the actual row contents — a new upload,
+an edited value — changes the fingerprint and triggers a one-time
+retrain automatically, with no manual cache invalidation needed.
 
-The bundled `Microgreens_dataa.xlsx` has two sheets: `Pakchoi` (176
-labelled rows — works) and `Fenugreek` (219 rows, but `Weight`/`Height`
-are entirely empty — correctly raises `InsufficientDataError` rather
-than crashing). This is a gap in the data file itself, not a bug.
+A file-based fallback (`_load_local_fallback_rows()`, reading from a
+local `data/Microgreens_dataa.xlsx` if present) exists only for
+running this engine standalone in scripts/tests — the live API never
+calls it.
 
-## Crop name matching
+## Known data gap (local fallback / test data only)
 
-Crop names are fuzzy-matched against the available sheet names using
-edit distance, so small typos (`"Pakchoy"`, `"Fenugrek"`) still
-resolve correctly. The match threshold scales with name length to
-avoid false positives — an earlier flat threshold let unrelated short
-names (e.g. `"Spinach"`) silently match `"Pakchoi"` and train on the
-wrong crop's data instead of raising `CropNotFoundError`. If a typo
-test ever returns the wrong crop instead of a 404, that threshold
+If you're using the bundled `Microgreens_dataa.xlsx` for local testing,
+note it has two sheets: `Pakchoi` (176 labelled rows — works) and
+`Fenugreek` (219 rows, but `Weight`/`Height` are entirely empty —
+correctly raises `InsufficientDataError` rather than crashing). This
+is a gap in that specific file, not a bug, and is unrelated to the
+live API path.
+
+## Crop name matching (local fallback only)
+
+In the live API path, `crop` is just a label attached to the rows you
+send — there's no sheet-name concept, so there's nothing to fuzzy-match
+against. This section applies only to `_load_local_fallback_rows()`,
+used for local scripts/tests: there, crop names are fuzzy-matched
+against the available sheet names in the local Excel file using edit
+distance, so small typos (`"Pakchoy"`, `"Fenugrek"`) still resolve
+correctly. The match threshold scales with name length to avoid false
+positives — an earlier flat threshold let unrelated short names (e.g.
+`"Spinach"`) silently match `"Pakchoi"` and train on the wrong crop's
+data instead of raising `CropNotFoundError`. If a typo test in local
+scripts ever returns the wrong crop instead of a 404, that threshold
 (`_closest_sheet()` in `engine/hydrobot.py`) is the first place to
 check.

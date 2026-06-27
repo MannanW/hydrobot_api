@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "include": ["**/*.py"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [".", "./engine"]
+    }
+  ]
+}

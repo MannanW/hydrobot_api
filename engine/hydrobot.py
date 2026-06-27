@@ -10,13 +10,16 @@
 #   STEP 9  golden recipe optimizer
 #   STEP 10 top-5 alternative recipes
 #
-# DATA SOURCE (current placeholder):
-#   `run_analysis()` loads rows from the bundled Excel workbook by
-#   matching `crop` to a sheet name. This stands in for a real DB
-#   fetch. Swap `_load_training_rows()` for a query against your
-#   `training_rows` table (filtered by user_id, and additionally by
-#   share_global=True rows when scope == "global") once that's wired
-#   up — the rest of the pipeline doesn't need to change.
+# DATA SOURCE (v4):
+#   `run_analysis()` / `get_cached_analysis()` take training rows
+#   directly as a parameter — a list of dicts, one per labelled trial,
+#   with feature columns matching ALL_FEATURES plus "Weight"/"Height".
+#   The caller (api/main.py) is responsible for fetching the right
+#   rows for the requested user_id + scope (private vs private+global)
+#   before calling in — this module has no knowledge of where rows
+#   came from or how access control was applied. The only file-based
+#   path left is `_load_local_fallback_rows()`, used by local
+#   scripts/tests run directly against this module, never by the API.
 # =====================================================================
 
 from __future__ import annotations
@@ -67,7 +70,15 @@ def train_test_split(
     )
 
 # ─────────────────────────────────────────────────────────────────────
-# Constants (mirrors hydrobotv4.py)
+# Constants
+#
+# NOTE: As of v4, training rows arrive directly in the API request
+# (sent by the Lovable backend, which owns the database) rather than
+# being read from a local Excel file. HYDROBOT_DATA_FILE / the bundled
+# data/Microgreens_dataa.xlsx are kept ONLY as an optional local
+# fallback for running/testing this engine standalone, outside the API
+# — see `_load_local_fallback_rows()` below. The live API path never
+# touches this file.
 # ─────────────────────────────────────────────────────────────────────
 DEFAULT_DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "Microgreens_dataa.xlsx"
 ROOT_DATA_FILE = Path(__file__).resolve().parent.parent / "Microgreens_dataa.xlsx"
@@ -97,6 +108,31 @@ def _load_workbook_sheets() -> list[str]:
 def _read_sheet(sheet_name: str) -> pd.DataFrame:
     df = pd.read_excel(DATA_FILE, sheet_name=sheet_name, engine="openpyxl")  # type: ignore[call-overload]
     return df.copy(deep=True)
+
+
+def _load_local_fallback_rows(crop: str) -> pd.DataFrame:
+    """
+    Local-file fallback used only by standalone scripts/tests, never
+    by the live API. Looks up `crop` against sheet names in the
+    bundled Excel workbook using fuzzy matching.
+    """
+    if not os.path.exists(DATA_FILE):
+        raise CropNotFoundError(f"Local fallback data file not found at {DATA_FILE}")
+
+    sheets = _load_workbook_sheets()
+    exact = next((s for s in sheets if s.lower() == crop.lower()), None)
+    sheet_name = exact or _closest_sheet(crop, sheets)
+    if sheet_name is None:
+        raise CropNotFoundError(
+            f"No crop matching '{crop}' found. Available crops: {', '.join(sheets)}"
+        )
+    return _read_sheet(sheet_name)
+
+
+# Keep this local fallback path available for standalone engine scripts/tests,
+# even though the live API route never calls it.
+if False:
+    _load_local_fallback_rows  # type: ignore[unused]
 
 
 def _ensure_cache_dir() -> None:
@@ -134,8 +170,19 @@ def _save_cached_analysis(crop: str, scope: str, fingerprint: str, payload: dict
     joblib.dump({"result": payload, "metadata": metadata}, path)  # type: ignore[call-arg]
 
 
-def get_cached_analysis(crop: str, scope: str, user_id: str) -> Optional[dict[str, Any]]:
-    df_raw = _load_training_rows(crop=crop, scope=scope, user_id=user_id)
+def get_cached_analysis(
+    crop: str, scope: str, rows: list[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """
+    Cheap pre-check: does a valid cached model already exist for this
+    exact (crop, scope, data) combination? Returns the cached result
+    dict if so, else None. Raises CropNotFoundError/InsufficientDataError
+    if `rows` itself is invalid (e.g. too few labelled rows) — this
+    lets the API surface that error immediately, before even
+    attempting to start a background training job.
+    """
+    _require_nonempty_rows(rows, crop)
+    df_raw = pd.DataFrame(rows)
     df, feature_cols, _quality = _clean_and_validate(df_raw, crop=crop)
     fingerprint = _training_data_fingerprint(df, feature_cols)
     return _load_cached_analysis(crop, scope, fingerprint)
@@ -185,6 +232,11 @@ class InsufficientDataError(Exception):
         )
 
 
+def _require_nonempty_rows(rows: list[dict[str, Any]], crop: str) -> None:
+    if not rows:
+        raise InsufficientDataError(crop, 0)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Levenshtein fuzzy crop matching (mirrors hydrobotv4.py)
 # ─────────────────────────────────────────────────────────────────────
@@ -218,32 +270,17 @@ def _closest_sheet(name: str, available: list[str]) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# DATA SOURCE — placeholder for a real DB fetch
+# DATA SOURCE
+#
+# As of v4, training rows are no longer loaded from a local file in
+# the live API path — they arrive directly in the request, fetched by
+# Lovable's backend (which already enforces row-level security: each
+# user's private rows + globally-shared rows for the requested scope).
+# `run_analysis()` / `get_cached_analysis()` below take `rows` as a
+# parameter for exactly this reason. `_load_local_fallback_rows()`
+# above is the only remaining file-based path, kept for local
+# scripts/tests run directly against this module.
 # ─────────────────────────────────────────────────────────────────────
-def _load_training_rows(crop: str, scope: str, user_id: str) -> pd.DataFrame:
-    """
-    PLACEHOLDER: loads from the bundled Excel workbook by crop sheet
-    name, ignoring user_id/scope. Replace this with a real query:
-
-        SELECT features, targets FROM training_rows
-        WHERE crop = :crop
-          AND (user_id = :user_id OR (:scope = 'global' AND share_global = true))
-
-    The returned DataFrame must contain columns matching ALL_FEATURES
-    (whichever subset is present) plus "Weight" and "Height".
-    """
-    if not os.path.exists(DATA_FILE):
-        raise CropNotFoundError(f"Data source not found at {DATA_FILE}")
-
-    sheets = _load_workbook_sheets()
-    exact = next((s for s in sheets if s.lower() == crop.lower()), None)
-    sheet_name = exact or _closest_sheet(crop, sheets)
-    if sheet_name is None:
-        raise CropNotFoundError(
-            f"No crop matching '{crop}' found. Available crops: {', '.join(sheets)}"
-        )
-
-    return _read_sheet(sheet_name)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -360,14 +397,20 @@ def _format_recipe(row: dict[Hashable, Any] | pd.Series[Any], feature_cols: list
 # ─────────────────────────────────────────────────────────────────────
 # PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────
-def run_analysis(crop: str, scope: str, user_id: str) -> dict[str, Any]:
+def run_analysis(crop: str, scope: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Runs the full HydroBot pipeline for a single crop and returns a
-    dict matching the API's response shape. Raises CropNotFoundError
-    or InsufficientDataError on bad input — callers should catch these
-    and translate to appropriate HTTP responses.
+    dict matching the API's response shape. `rows` is the training
+    data — a list of dicts, each containing the feature columns
+    (whichever of ALL_FEATURES are present) plus "Weight" and
+    "Height" — already filtered to the right scope (this user's
+    private rows, plus globally-shared rows if scope == "global") by
+    the caller. Raises CropNotFoundError or InsufficientDataError on
+    bad input — callers should catch these and translate to
+    appropriate HTTP responses.
     """
-    df_raw = _load_training_rows(crop=crop, scope=scope, user_id=user_id)
+    _require_nonempty_rows(rows, crop)
+    df_raw = pd.DataFrame(rows)
     df, feature_cols, quality = _clean_and_validate(df_raw, crop=crop)
     quality["crop"] = crop
     quality["scope"] = scope
