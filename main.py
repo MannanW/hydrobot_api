@@ -165,6 +165,7 @@ class ModelMetrics(BaseModel):
 class ModelPerformance(BaseModel):
     weight: ModelMetrics
     height: ModelMetrics
+    height_excluded_pre_emergence_rows: int
     cv_folds: int
 
 
