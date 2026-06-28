@@ -150,6 +150,7 @@ class DataQualitySummary(BaseModel):
     total_rows_in_sheet: int
     missing_targets: int
     pre_emergence_rows: int
+    duplicate_rows_removed: int
     feature_list: list[str]
     min_rows_required: int
     status: str

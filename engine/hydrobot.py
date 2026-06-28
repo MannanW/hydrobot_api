@@ -301,6 +301,21 @@ def _clean_and_validate(df_raw: pd.DataFrame, crop: str) -> tuple[pd.DataFrame, 
             f"Missing target column(s) {missing_targets} for crop '{crop}'."
         )
 
+    # Drop exact duplicates — rows identical across every feature AND
+    # both targets. This only removes rows that were truly identical
+    # as submitted (e.g. the same trial uploaded twice, possibly by
+    # different users contributing to the global pool), never rows
+    # that merely share a similar recipe with a different outcome —
+    # those are real biological variance, not duplication, and are
+    # always kept. Done BEFORE the median-fill below, deliberately:
+    # filling missing values first could make two originally-different
+    # rows look identical only because of imputation, which would be
+    # an incorrect reason to drop one of them.
+    rows_before_dedup = len(df_raw)
+    dedup_cols = feature_cols + [TARGET_WEIGHT, TARGET_HEIGHT]
+    df_raw = df_raw.drop_duplicates(subset=dedup_cols, keep="first")
+    duplicate_rows_removed = rows_before_dedup - len(df_raw)
+
     total_rows = len(df_raw)
     rows_with_data = int(df_raw[[TARGET_WEIGHT, TARGET_HEIGHT]].dropna().shape[0])
     rows_zero_h = int((df_raw[TARGET_HEIGHT] == 0).sum())
@@ -322,6 +337,7 @@ def _clean_and_validate(df_raw: pd.DataFrame, crop: str) -> tuple[pd.DataFrame, 
         "rows_used": rows_with_data,
         "missing_targets": total_rows - rows_with_data,
         "pre_emergence_rows": rows_zero_h,
+        "duplicate_rows_removed": duplicate_rows_removed,
         "feature_list": feature_cols,
         "min_rows_required": MIN_ROWS,
         "status": "ok",
