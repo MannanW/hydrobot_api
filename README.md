@@ -154,6 +154,26 @@ local `data/Microgreens_dataa.xlsx` if present) exists only for
 running this engine standalone in scripts/tests — the live API never
 calls it.
 
+## Exact-duplicate rows are removed automatically
+
+Before training, rows that are identical across every feature AND
+both targets (Weight and Height) are deduplicated, keeping one copy.
+This guards against a real scenario in a shared global pool: the same
+trial getting uploaded more than once (e.g. by different users, or
+the same user re-contributing the same file) shouldn't count as two
+independent data points — left in, it can silently leak a duplicated
+row across the train/test split, making R² look better than it
+actually is. `data_quality_summary.duplicate_rows_removed` reports
+how many rows this removed, so it's visible rather than a silent
+internal detail.
+
+This is deliberately narrow: rows that share a similar recipe but
+have a *different* outcome are never touched — that's real biological
+variance the model should learn from, not duplication. Deduplication
+runs on the raw uploaded values, before missing-value imputation, so
+two originally-different rows are never incorrectly treated as
+duplicates just because imputation happened to fill them in the same way.
+
 ## Height model excludes pre-emergence rows
 
 The Weight model trains on every labelled row. The Height model
