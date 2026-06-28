@@ -154,6 +154,35 @@ local `data/Microgreens_dataa.xlsx` if present) exists only for
 running this engine standalone in scripts/tests — the live API never
 calls it.
 
+## Height model excludes pre-emergence rows
+
+The Weight model trains on every labelled row. The Height model
+trains only on rows where `Height > 0` — rows where the plant hadn't
+visibly emerged yet at measurement time. This was a real fix, not a
+cosmetic one: on a combined dataset where roughly two-thirds of rows
+were pre-emergence (Height = 0), training Height on all rows let the
+model get "free" accuracy by trivially predicting zero most of the
+time — R² looked great (0.86–0.999 depending on the dataset) without
+the model actually learning what drives height among plants that did
+grow. Verified directly against real data: excluding pre-emergence
+rows dropped Height's R² to a more honest ~0.6, with the model now
+being evaluated on (and the golden recipe's height prediction now
+based on) the harder, more relevant subset.
+
+`model_performance.height_excluded_pre_emergence_rows` reports how
+many rows were excluded this way, so this is visible in the API
+response rather than a silent internal detail. If a crop+scope
+combination has so few "emerged" rows that excluding pre-emergence
+rows drops below the 20-row minimum (even though the *total* row
+count clears that minimum), `InsufficientDataError` is raised with a
+message that specifically calls out the height-model exclusion, so
+it's distinguishable from a generic "not enough data" error.
+
+Weight is unaffected by this — confirmed directly that Weight's
+range and mean don't differ materially between pre-emergence and
+post-emergence rows, so excluding rows for Weight's sake would have
+thrown away real signal for no benefit.
+
 ## Known data gap (local fallback / test data only)
 
 If you're using the bundled `Microgreens_dataa.xlsx` for local testing,
